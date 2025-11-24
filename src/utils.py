@@ -2,7 +2,7 @@ import sys
 import pickle
 from src.exception import CustomException
 
-def sace_object(file_path, obj):
+def save_object(file_path, obj):
     """
     Save a Python object to a file using pickle.
 
