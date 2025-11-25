@@ -24,6 +24,20 @@
             <button type="submit">Run Prediction</button>
         </form>
 
+        {% if results %}
+    <h3>Prediction Result:</h3>
+    <ul>
+        {% for r in results %}
+            <li>{{ r }}</li>
+        {% endfor %}
+    </ul>
+        {% endif %}
+
+        {% if error %}
+            <h3 style="color:red;">Error: {{ error }}</h3>
+        {% endif %}
+
+
         {% if error %}
             <div class="error">{{ error }}</div>
         {% endif %}

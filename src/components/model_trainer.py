@@ -26,7 +26,7 @@ class ModelTrainer:
             ## Define Models 
             models = {
                 "Random Forest": RandomForestClassifier(n_estimators=50, n_jobs=-1),
-                "XGBoost": XGBClassifier(eval_metric='logloss', n_estimators=100, max_depth=5, n_jobs=-1),
+                "XGBoost": XGBClassifier(learning_rate=0.1, n_estimators=200, max_depth=8, subsample=0.9, colsample_bytree=0.9, eval_metric="lofloss"),
                 "CatBoost": CatBoostClassifier(verbose=False)
             }
     
