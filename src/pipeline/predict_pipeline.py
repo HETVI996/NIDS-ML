@@ -29,5 +29,6 @@ class PredictPipeline:
         X.fillna(X.median(), inplace=True)
 
         preds = model.predict(X)
-        return preds
+        return ["DDoS" if p == 1 else "BENIGN" for p in preds]
+
 
