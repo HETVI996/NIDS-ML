@@ -44,34 +44,34 @@ The project structure is designed to be **modular, extendable, and production-re
 ---
 
 ## 🗂️ Project Structure
+## 📁 Project Structure
 
+```text
 NIDS-ML/
 │
 ├── data/
-│ ├── raw/ # Original dataset
-│ └── processed/ # Train/Test splits
+│   ├── raw/                 
+│   └── processed/            
 │
 ├── src/
-│ ├── components/
-│ │ ├── data_ingestion.py
-│ │ ├── data_transformation.py
-│ │ └── model_trainer.py
-│ │
-│ ├── pipeline/
-│ │ ├── train_pipeline.py
-│ │ └── predict_pipeline.py
-│ │
-│ ├── utils.py
-│ ├── logger.py
-│ └── exception.py
+│   ├── components/
+│   │   ├── data_ingestion.py
+│   │   ├── data_transformation.py
+│   │   └── model_trainer.py
+│   │
+│   ├── pipeline/
+│   │   ├── train_pipeline.py
+│   │   └── predict_pipeline.py
+│   │
+│   ├── utils.py
+│   ├── logger.py
+│   └── exception.py
 │
-├── artifacts/ # Saved models & preprocessors
+├── artifacts/               
 ├── requirements.txt
 ├── setup.py
 └── README.md
 
-
----
 
 ## ⚙️ Tech Stack
 
