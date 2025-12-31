@@ -43,7 +43,7 @@ The project structure is designed to be **modular, extendable, and production-re
 
 ---
 
-## 🗂️ Project Structure
+
 ## 📁 Project Structure
 
 ```text
