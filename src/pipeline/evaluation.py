@@ -68,6 +68,7 @@ def prepare_data():
     X_test        = test_df.drop(columns=["Label"]).values
     y_test_str    = test_df["Label"]
     y_test        = label_encoder.transform(y_test_str)
+    X_test = pd.DataFrame(X_test, columns=transformer.feature_names)
     y_pred        = model.predict(X_test)
 
     # Predicted probabilities needed for ROC — not all models support predict_proba.
@@ -185,46 +186,40 @@ def save_confusion_matrix(y_test, y_pred, class_names):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def save_roc_curves(y_test, y_prob, class_names):
-    """
-    Saves reports/roc_curves.png
-
-    One-vs-rest ROC: for each class, the model's ability to distinguish
-    "this class vs everything else". AUC values are annotated on each curve.
-
-    For publication: AUC scores are commonly reported in Table 2 and the
-    ROC figure goes in supplementary material (or main if space allows).
-    """
     if y_prob is None:
         logger.warning("Skipping ROC curves — no predict_proba available.")
         return
 
     n_classes = len(class_names)
-
-    # Binarize y_test for one-vs-rest
-    y_test_bin = label_binarize(y_test, classes=list(range(n_classes)))
-
     fig, ax = plt.subplots(figsize=(10, 8))
     colors = plt.cm.tab20(np.linspace(0, 1, n_classes))
-
     auc_scores = {}
-    for i, (class_name, color) in enumerate(zip(class_names, colors)):
-        fpr, tpr, _ = roc_curve(y_test_bin[:, i], y_prob[:, i])
+
+    if n_classes == 2:
+        # Binary case: sklearn label_binarize returns shape (n,1) for 2 classes.
+        # Use y_prob[:, 1] (probability of positive class) directly.
+        fpr, tpr, _ = roc_curve(y_test, y_prob[:, 1])
         roc_auc = auc(fpr, tpr)
-        auc_scores[class_name] = round(roc_auc, 4)
-        ax.plot(
-            fpr, tpr,
-            color=color,
-            lw=1.5,
-            label=f"{class_name} (AUC={roc_auc:.3f})"
-        )
+        ax.plot(fpr, tpr, color=colors[1], lw=1.5,
+                label=f"{class_names[1]} (AUC={roc_auc:.3f})")
+        auc_scores[class_names[1]] = round(roc_auc, 4)
+    else:
+        # Multi-class: one-vs-rest
+        y_test_bin = label_binarize(y_test, classes=list(range(n_classes)))
+        for i, (class_name, color) in enumerate(zip(class_names, colors)):
+            fpr, tpr, _ = roc_curve(y_test_bin[:, i], y_prob[:, i])
+            roc_auc = auc(fpr, tpr)
+            auc_scores[class_name] = round(roc_auc, 4)
+            ax.plot(fpr, tpr, color=color, lw=1.5,
+                    label=f"{class_name} (AUC={roc_auc:.3f})")
 
     ax.plot([0, 1], [0, 1], "k--", lw=1, alpha=0.5, label="Random classifier")
     ax.set_xlim([0.0, 1.0])
     ax.set_ylim([0.0, 1.02])
     ax.set_xlabel("False positive rate", fontsize=11)
     ax.set_ylabel("True positive rate", fontsize=11)
-    ax.set_title("ROC curves — one-vs-rest per class", fontsize=12)
-    ax.legend(loc="lower right", fontsize=7, ncol=2)
+    ax.set_title("ROC curves", fontsize=12)
+    ax.legend(loc="lower right", fontsize=9)
     plt.tight_layout()
 
     out_path = os.path.join(REPORTS_DIR, "roc_curves.png")
@@ -232,7 +227,6 @@ def save_roc_curves(y_test, y_prob, class_names):
     plt.close()
     logger.info(f"Saved: {out_path}")
 
-    # Save AUC scores as CSV for the paper table
     auc_df = pd.DataFrame.from_dict(auc_scores, orient="index", columns=["ROC-AUC"])
     auc_csv = os.path.join(REPORTS_DIR, "auc_scores.csv")
     auc_df.to_csv(auc_csv)
