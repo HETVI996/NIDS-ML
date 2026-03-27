@@ -214,3 +214,5 @@ models/
 reports/
 *.pkl
 *.png
+
+catboost_info/
