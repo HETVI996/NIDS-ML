@@ -209,3 +209,8 @@ __marimo__/
 
 data/raw/
 !data/processed/
+
+models/
+reports/
+*.pkl
+*.png
