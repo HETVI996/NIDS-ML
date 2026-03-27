@@ -1,29 +1,13 @@
 """
-xai_pipeline.py
+Xai_pipeline.py — SHAP + LIME explainability for the trained NIDS model.
 
-Explainability analysis for the trained DDoS detection model.
-Produces two categories of explanations required for publication:
+Outputs saved to reports/:
+  - shap_global_importance.png
+  - shap_beeswarm_{class}.png  (one per class)
+  - lime_misclassified_{i}.png (up to LIME_N_SAMPLES)
 
-  1. GLOBAL explanations (SHAP):
-     - Feature importance bar chart (which features matter most overall)
-     - Beeswarm plot per attack class (how each feature pushes prediction
-       toward or away from a specific class)
-     This answers the paper question: "what does the model rely on?"
-
-  2. LOCAL explanations (LIME):
-     - Per-instance explanation for a sample of misclassified flows
-     This answers the paper question: "why did the model fail on these cases?"
-
-Both sets of outputs are saved to reports/ as PNG files ready for the paper.
-
-Usage:
-    python xai_pipeline.py
-
-Requirements (add to requirements.txt):
-    shap>=0.44
-    lime>=0.2.0.1
-    matplotlib>=3.7
-    seaborn>=0.13
+Run from project root:
+    python -m src.pipeline.Xai_pipeline
 """
 
 import os
@@ -31,7 +15,7 @@ import sys
 import numpy as np
 import pandas as pd
 import matplotlib
-matplotlib.use("Agg")  # non-interactive backend — safe for headless servers
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import seaborn as sns
 
@@ -42,154 +26,109 @@ from src.utils import load_object
 from src.components.data_transformation import DataTransformation
 from src.logger import logger
 
-
 # ─────────────────────────────────────────────────────────────────────────────
-# Paths
+# Config
 # ─────────────────────────────────────────────────────────────────────────────
-MODEL_PATH        = "models/model.pkl"
-ENCODER_PATH      = "models/label_encoder.pkl"
-TEST_DATA_PATH    = "data/processed/test.csv"
-TRAIN_DATA_PATH   = "data/processed/train.csv"
-REPORTS_DIR       = "reports"
-
-# How many test samples to run SHAP on.
-# SHAP on a full test set is slow (especially for VotingEnsemble).
-# 2000 is enough for stable global importance plots; use more if you have time.
-SHAP_SAMPLE_SIZE  = 2000
-
-# Number of misclassified flows to explain with LIME.
-LIME_N_SAMPLES    = 10
+MODEL_PATH       = "models/model.pkl"
+ENCODER_PATH     = "models/label_encoder.pkl"
+TRAIN_DATA_PATH  = "data/processed/train.csv"
+TEST_DATA_PATH   = "data/processed/test.csv"
+REPORTS_DIR      = "reports"
+SHAP_SAMPLE_SIZE = 2000
+LIME_N_SAMPLES   = 10
 
 os.makedirs(REPORTS_DIR, exist_ok=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 1. Load model, encoder, and test data
+# 1. Load artifacts
 # ─────────────────────────────────────────────────────────────────────────────
-
 def load_artifacts():
     logger.info("Loading model and label encoder...")
-    model = load_object(MODEL_PATH)
+    model         = load_object(MODEL_PATH)
     label_encoder = load_object(ENCODER_PATH)
     return model, label_encoder
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. Load and transform test data
+# ─────────────────────────────────────────────────────────────────────────────
 def load_test_data(label_encoder):
-    """
-    Loads the processed test CSV and returns X_test (features only) and y_test
-    (numeric labels as encoded during training).
+    logger.info("Loading and transforming data...")
 
-    We re-apply DataTransformation.transform() here so that the scaler is
-    consistent with what was used during training.
+    train_df_raw = pd.read_csv(TRAIN_DATA_PATH, low_memory=False)
+    test_df_raw  = pd.read_csv(TEST_DATA_PATH,  low_memory=False)
 
-    IMPORTANT: We need the transformer that was fit on training data.
-    Since we saved the model but not the transformer, we refit on train data
-    here. This is the correct approach — the transformer is refit on training
-    data, NOT on test data.
-    """
-    logger.info("Loading and transforming test data...")
+    transformer  = DataTransformation()
+    train_df     = transformer.fit_transform(train_df_raw)
+    test_df      = transformer.transform(test_df_raw)
 
-    train_df_raw = pd.read_csv(TRAIN_DATA_PATH)
-    test_df_raw  = pd.read_csv(TEST_DATA_PATH)
-
-    transformer = DataTransformation()
-    train_df = transformer.fit_transform(train_df_raw)  # fit on train
-    test_df  = transformer.transform(test_df_raw)       # transform test only
-
-    X_test    = test_df.drop(columns=["Label"])
-    y_test_str = test_df["Label"]
-
-    # Encode labels to numeric using the saved encoder.
-    # We use transform() here (not fit_transform) to apply the exact same
-    # mapping that was used during model training.
-    y_test = label_encoder.transform(y_test_str)
-
+    X_test       = test_df.drop(columns=["Label"])
+    y_test_str   = test_df["Label"]
+    y_test       = label_encoder.transform(y_test_str)
     feature_names = X_test.columns.tolist()
 
-    return X_test.values, y_test, feature_names, label_encoder.classes_
+    # Return as DataFrame to avoid feature-name warnings from sklearn
+    return X_test, y_test, feature_names, label_encoder.classes_
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2. Resolve the underlying tree model from VotingEnsemble if needed
+# 3. Extract SHAP-compatible single tree model from VotingClassifier
 # ─────────────────────────────────────────────────────────────────────────────
-
 def get_shap_compatible_model(model):
-    """
-    SHAP's TreeExplainer works on tree-based models (RF, XGB, CatBoost).
-    It does NOT directly support VotingClassifier (which is an ensemble wrapper).
-
-    Strategy:
-    - If the saved model IS a VotingClassifier, extract its XGBoost sub-estimator
-      for SHAP. XGBoost produces the most interpretable SHAP values and is the
-      model with the highest weight in the ensemble (weight=2).
-    - If the model is already RF/XGB/CatBoost, use it directly.
-
-    This is documented in the paper as: "SHAP values were computed on the
-    XGBoost component of the ensemble, which carries the highest weight."
-    """
     from sklearn.ensemble import VotingClassifier, RandomForestClassifier
-    from xgboost import XGBClassifier
 
     if isinstance(model, VotingClassifier):
-        logger.info(
-            "Model is VotingClassifier. Extracting XGBoost sub-estimator for SHAP."
-        )
-        for name, estimator in model.estimators_:
-            if isinstance(estimator, XGBClassifier):
-                logger.info(f"Using sub-estimator: {name}")
+        logger.info("Model is VotingClassifier. Extracting RandomForest sub-estimator for SHAP.")
+        for estimator in model.estimators_:
+            if isinstance(estimator, RandomForestClassifier):
+                logger.info("Using RandomForest sub-estimator for SHAP.")
                 return estimator
-        # Fallback: use the first estimator if no XGB found
-        logger.warning("No XGBClassifier found in VotingClassifier. Using first estimator.")
-        return model.estimators_[0][1]
+        logger.warning("No RandomForestClassifier found. Using first sub-estimator.")
+        return model.estimators_[0]
 
     return model
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 3. SHAP: Global feature importance
+# 4. SHAP global importance + per-class beeswarm
 # ─────────────────────────────────────────────────────────────────────────────
-
 def run_shap_analysis(model, X_test, feature_names, class_names):
-    """
-    Runs SHAP TreeExplainer on a sample of the test set.
-
-    Produces:
-      - reports/shap_global_importance.png  — bar chart of mean |SHAP| per feature
-      - reports/shap_beeswarm_{class}.png   — beeswarm for each attack class
-
-    Why SHAP TreeExplainer specifically:
-    - Exact (not approximate) for tree-based models
-    - Produces per-class SHAP values for multi-class models
-    - Much faster than KernelExplainer for tree ensembles
-    """
-    logger.info(f"Running SHAP on {SHAP_SAMPLE_SIZE} test samples...")
+    logger.info(f"Running SHAP on up to {SHAP_SAMPLE_SIZE} test samples...")
 
     shap_model = get_shap_compatible_model(model)
 
-    # Sample for speed — stratified if possible
-    n = min(SHAP_SAMPLE_SIZE, len(X_test))
+    n   = min(SHAP_SAMPLE_SIZE, len(X_test))
     idx = np.random.choice(len(X_test), size=n, replace=False)
-    X_sample = X_test[idx]
+    X_sample = X_test.iloc[idx].values
 
-    explainer = shap.TreeExplainer(shap_model)
+    explainer   = shap.TreeExplainer(shap_model)
     shap_values = explainer.shap_values(X_sample)
-    # shap_values is a list of arrays if multi-class, or a single array if binary.
-    # Shape per class: (n_samples, n_features)
 
-    is_multiclass = isinstance(shap_values, list)
 
-    # ── 3a. Global feature importance bar chart ──────────────────────────────
-    # Mean absolute SHAP value across all classes and samples.
-    # This is the standard way to rank features in a multi-class setting.
-    if is_multiclass:
-        mean_abs_shap = np.mean(
-            [np.abs(sv).mean(axis=0) for sv in shap_values], axis=0
-        )
+    # Normalise to consistent format: list of 2D arrays, one per class.
+    # RandomForest returns 3D array (n_classes, n_samples, n_features).
+    # XGBoost binary returns 2D array (n_samples, n_features).
+    # XGBoost multi returns list of 2D arrays.
+    # Shape is (n_samples, n_features, n_classes) — this SHAP version's RF format.
+    # Reorder to (n_classes, n_samples, n_features) for uniform handling.
+    if isinstance(shap_values, np.ndarray) and shap_values.ndim == 3:
+        # (2000, 22, 2) → list of two (2000, 22) arrays, one per class
+        shap_list = [shap_values[:, :, i] for i in range(shap_values.shape[2])]
+    elif isinstance(shap_values, list):
+        shap_list = shap_values
     else:
-        mean_abs_shap = np.abs(shap_values).mean(axis=0)
+        shap_list = [shap_values]
+
+    is_multiclass = len(shap_list) > 1
+
+    # Global importance: mean |SHAP| across all classes → shape (n_features,)
+    mean_abs_shap = np.mean(
+        [np.abs(sv).mean(axis=0) for sv in shap_list], axis=0
+    ).flatten()  # ensure 1D
 
     importance_df = pd.DataFrame({
-        "feature": feature_names,
+        "feature":       feature_names,
         "mean_abs_shap": mean_abs_shap
     }).sort_values("mean_abs_shap", ascending=False)
 
@@ -200,86 +139,51 @@ def run_shap_analysis(model, X_test, feature_names, class_names):
         y="feature",
         palette="viridis"
     )
-    plt.title("Top 20 features by mean |SHAP| value (all classes)", fontsize=13)
+    plt.title("Top 20 features by mean |SHAP| value", fontsize=13)
     plt.xlabel("Mean |SHAP value|")
     plt.ylabel("Feature")
     plt.tight_layout()
-    out_path = os.path.join(REPORTS_DIR, "shap_global_importance.png")
-    plt.savefig(out_path, dpi=150)
+    out = os.path.join(REPORTS_DIR, "shap_global_importance.png")
+    plt.savefig(out, dpi=150)
     plt.close()
-    logger.info(f"Saved: {out_path}")
+    logger.info(f"Saved: {out}")
 
-    # ── 3b. Beeswarm plot per class ──────────────────────────────────────────
-    # For each attack class, shows how feature values (colour) push the
-    # prediction up or down. This is the key figure for the paper — it shows
-    # which flow statistics distinguish each attack type from others.
-    if is_multiclass:
-        for class_idx, class_name in enumerate(class_names):
-            safe_name = class_name.replace(" ", "_").replace("/", "-")
-            fig, ax = plt.subplots(figsize=(10, 7))
-            shap.summary_plot(
-                shap_values[class_idx],
-                X_sample,
-                feature_names=feature_names,
-                show=False,
-                plot_type="violin"
-            )
-            plt.title(f"SHAP summary — class: {class_name}", fontsize=12)
-            plt.tight_layout()
-            out_path = os.path.join(REPORTS_DIR, f"shap_beeswarm_{safe_name}.png")
-            plt.savefig(out_path, dpi=150, bbox_inches="tight")
-            plt.close()
-            logger.info(f"Saved: {out_path}")
-    else:
-        # Binary case: single beeswarm
-        fig, ax = plt.subplots(figsize=(10, 7))
-        shap.summary_plot(shap_values, X_sample, feature_names=feature_names, show=False)
-        plt.title("SHAP summary — binary classification", fontsize=12)
+    # Beeswarm per class
+    for class_idx, class_name in enumerate(class_names):
+        safe = class_name.replace(" ", "_").replace("/", "-")
+        shap.summary_plot(
+            shap_list[class_idx], X_sample,
+            feature_names=feature_names,
+            show=False, plot_type="violin"
+        )
+        plt.title(f"SHAP summary — {class_name}", fontsize=12)
         plt.tight_layout()
-        out_path = os.path.join(REPORTS_DIR, "shap_beeswarm.png")
-        plt.savefig(out_path, dpi=150, bbox_inches="tight")
+        out = os.path.join(REPORTS_DIR, f"shap_beeswarm_{safe}.png")
+        plt.savefig(out, dpi=150, bbox_inches="tight")
         plt.close()
-        logger.info(f"Saved: {out_path}")
-
-    return shap_values, idx
-
-
+        logger.info(f"Saved: {out}")
 # ─────────────────────────────────────────────────────────────────────────────
-# 4. LIME: Local explanations on misclassified flows
+# 5. LIME on misclassified flows
 # ─────────────────────────────────────────────────────────────────────────────
-
 def run_lime_analysis(model, X_test, y_test, feature_names, class_names):
-    """
-    Finds misclassified flows in the test set and generates a LIME explanation
-    for each of the first LIME_N_SAMPLES misclassifications.
+    logger.info("Finding misclassified samples for LIME...")
 
-    Why LIME on misclassified flows:
-    - These are the paper's "error analysis" section
-    - They reveal which feature patterns confused the model
-    - Reviewers expect explanation of failure modes, not just successes
-
-    Output:
-      - reports/lime_misclassified_{i}.png for i in range(LIME_N_SAMPLES)
-    """
-    logger.info("Finding misclassified test samples for LIME...")
-
-    y_pred = model.predict(X_test)
+    X_arr  = X_test.values
+    y_pred = model.predict(X_arr)
     misclassified_idx = np.where(y_pred != y_test)[0]
 
     if len(misclassified_idx) == 0:
-        logger.info("No misclassifications found. Skipping LIME.")
+        logger.info("No misclassifications found — perfect predictions. Skipping LIME.")
+        print("No misclassified samples found. LIME skipped.")
         return
 
     logger.info(
-        f"Found {len(misclassified_idx)} misclassified samples. "
+        f"{len(misclassified_idx)} misclassified samples found. "
         f"Explaining first {LIME_N_SAMPLES}."
     )
 
-    # LimeTabularExplainer requires the training data statistics (or a sample)
-    # to understand the feature distributions. X_test is acceptable here as a
-    # proxy — for publication, use X_train for more accurate neighbourhood sampling.
     explainer = LimeTabularExplainer(
-        training_data=X_test,
+        training_data=X_arr,
         feature_names=feature_names,
         class_names=class_names,
         mode="classification",
@@ -288,39 +192,36 @@ def run_lime_analysis(model, X_test, y_test, feature_names, class_names):
     )
 
     for i, idx in enumerate(misclassified_idx[:LIME_N_SAMPLES]):
-        instance = X_test[idx]
         true_label = class_names[y_test[idx]]
         pred_label = class_names[y_pred[idx]]
 
-        explanation = explainer.explain_instance(
-            data_row=instance,
+        exp = explainer.explain_instance(
+            data_row=X_arr[idx],
             predict_fn=model.predict_proba,
             num_features=10,
             top_labels=1
         )
-
-        fig = explanation.as_pyplot_figure(label=y_pred[idx])
+        fig = exp.as_pyplot_figure(label=int(y_pred[idx]))
         fig.suptitle(
             f"LIME — sample {idx}  |  True: {true_label}  |  Predicted: {pred_label}",
             fontsize=10
         )
         plt.tight_layout()
-        out_path = os.path.join(REPORTS_DIR, f"lime_misclassified_{i}.png")
-        plt.savefig(out_path, dpi=150, bbox_inches="tight")
+        out = os.path.join(REPORTS_DIR, f"lime_misclassified_{i}.png")
+        plt.savefig(out, dpi=150, bbox_inches="tight")
         plt.close()
-        logger.info(f"Saved: {out_path}")
+        logger.info(f"Saved: {out}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5. Entry point
+# Entry point
 # ─────────────────────────────────────────────────────────────────────────────
-
 if __name__ == "__main__":
-    model, label_encoder = load_artifacts()
+    model, label_encoder    = load_artifacts()
     X_test, y_test, feature_names, class_names = load_test_data(label_encoder)
 
     run_shap_analysis(model, X_test, feature_names, class_names)
     run_lime_analysis(model, X_test, y_test, feature_names, class_names)
 
-    logger.info(f"XAI analysis complete. All outputs saved to: {REPORTS_DIR}/")
-    print(f"Done. Check {REPORTS_DIR}/ for SHAP and LIME plots.")
+    logger.info(f"XAI complete. Outputs in: {REPORTS_DIR}/")
+    print(f"\nDone. Check {REPORTS_DIR}/ for SHAP and LIME plots.")
