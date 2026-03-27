@@ -76,7 +76,6 @@ class ModelTrainer:
                 subsample=0.9,
                 colsample_bytree=0.9,
                 eval_metric="mlogloss" if not is_binary else "logloss",
-                use_label_encoder=False,
             )
             if not is_binary:
                 xgb_params["objective"] = "multi:softprob"
